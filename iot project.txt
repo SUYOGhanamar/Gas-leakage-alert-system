@@ -1,0 +1,485 @@
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+
+// ======================================
+// WIFI CONFIGURATION
+// ======================================
+const char* WIFI_SSID = "HANAMAR";
+const char* WIFI_PASSWORD = "12341234";
+
+// ======================================
+// HARDWARE PINS
+// ======================================
+#define MQ2_SENSOR A0
+#define YELLOW_LED D1
+#define RED_LED D2
+#define BUZZER D5
+
+// ======================================
+// SENSOR CONFIGURATION
+// ======================================
+const int GAS_THRESHOLD = 240;
+const int RESET_THRESHOLD = 220;
+
+const unsigned long WARMUP_TIME = 60000UL;
+const unsigned long READ_INTERVAL = 500UL;
+
+// ======================================
+// OUTPUT POLARITY
+// Change to true only if that output
+// is wired active-LOW.
+// ======================================
+const bool YELLOW_ACTIVE_LOW = false;
+const bool RED_ACTIVE_LOW = false;
+const bool BUZZER_ACTIVE_LOW = false;
+
+// ======================================
+// WEB SERVER
+// ======================================
+ESP8266WebServer server(80);
+
+// ======================================
+// GLOBAL VARIABLES
+// ======================================
+int gasValue = 0;
+
+bool sensorReady = false;
+bool smokeDetected = false;
+
+unsigned long startupTime = 0;
+unsigned long lastRead = 0;
+unsigned long lastWiFiCheck = 0;
+
+// ======================================
+// OUTPUT FUNCTION
+// ======================================
+void writeOutput(int pin, bool turnOn, bool activeLow) {
+  digitalWrite(
+    pin,
+    turnOn ? (activeLow ? LOW : HIGH)
+           : (activeLow ? HIGH : LOW)
+  );
+}
+
+// ======================================
+// ALARM CONTROL
+// ======================================
+void updateAlarm() {
+
+  bool normalMode = sensorReady && !smokeDetected;
+  bool dangerMode = sensorReady && smokeDetected;
+
+  writeOutput(YELLOW_LED, normalMode, YELLOW_ACTIVE_LOW);
+  writeOutput(RED_LED, dangerMode, RED_ACTIVE_LOW);
+  writeOutput(BUZZER, dangerMode, BUZZER_ACTIVE_LOW);
+}
+
+// ======================================
+// SENSOR READING
+// ======================================
+void readMQ2() {
+
+  long total = 0;
+
+  for (int i = 0; i < 10; i++) {
+    total += analogRead(MQ2_SENSOR);
+    delay(2);
+  }
+
+  gasValue = total / 10;
+
+  if (millis() - startupTime < WARMUP_TIME) {
+
+    sensorReady = false;
+    smokeDetected = false;
+
+  } else {
+
+    sensorReady = true;
+
+    if (gasValue >= GAS_THRESHOLD) {
+      smokeDetected = true;
+    }
+
+    if (gasValue <= RESET_THRESHOLD) {
+      smokeDetected = false;
+    }
+  }
+
+  updateAlarm();
+
+  // SERIAL MONITOR
+  Serial.println("--------------------------");
+
+  Serial.print("MQ2 Reading: ");
+  Serial.println(gasValue);
+
+  Serial.print("Sensor Ready: ");
+  Serial.println(sensorReady ? "YES" : "NO");
+
+  Serial.print("Smoke Status: ");
+  Serial.println(smokeDetected ? "DETECTED" : "NORMAL");
+
+  Serial.print("Yellow D1 GPIO: ");
+  Serial.println(digitalRead(YELLOW_LED));
+
+  Serial.print("Red D2 GPIO: ");
+  Serial.println(digitalRead(RED_LED));
+
+  Serial.print("Buzzer D5 GPIO: ");
+  Serial.println(digitalRead(BUZZER));
+
+  Serial.println("--------------------------");
+}
+
+// ======================================
+// DASHBOARD HTML
+// ======================================
+const char DASHBOARD[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<title>MQ-2 Gas Monitoring System</title>
+
+<style>
+* {box-sizing:border-box;}
+
+body {
+  margin:0;
+  background:#101d32;
+  color:white;
+  font-family:Arial,sans-serif;
+}
+
+header {
+  padding:24px;
+  background:#162c48;
+}
+
+header p {color:#38d9e8;}
+
+.container {
+  max-width:950px;
+  margin:25px auto;
+  padding:15px;
+}
+
+.cards {
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:15px;
+}
+
+.card {
+  background:#287da1;
+  padding:23px;
+  border-radius:14px;
+  margin-bottom:18px;
+}
+
+.value {
+  font-size:42px;
+  font-weight:bold;
+  color:#55f0ff;
+}
+
+.status {
+  font-size:25px;
+  font-weight:bold;
+  margin:18px 0;
+}
+
+.normal {color:#7dffb0;}
+.danger {color:#ff6666;}
+.warmup {color:#ffd166;}
+
+canvas {
+  width:100%;
+  height:250px;
+}
+
+.info {
+  background:#1c3553;
+  padding:20px;
+  border-radius:14px;
+}
+
+@media(max-width:600px) {
+  .cards {grid-template-columns:1fr;}
+}
+</style>
+</head>
+
+<body>
+
+<header>
+<h2>MQ-2 Gas Monitoring System</h2>
+<p>IoT Based Gas Leakage & Smoke Detection</p>
+</header>
+
+<div class="container">
+
+<h2>Live Dashboard</h2>
+
+<div class="cards">
+
+<div class="card">
+<h3>GAS SENSOR LEVEL</h3>
+<div class="value" id="gas">---</div>
+<p>Raw ADC Reading (0-1023)</p>
+</div>
+
+<div class="card">
+<h3>SYSTEM STATUS</h3>
+<div class="status warmup" id="status">
+CONNECTING
+</div>
+<p id="outputs">Waiting for sensor</p>
+</div>
+
+</div>
+
+<div class="card">
+<h3>REAL-TIME GAS LEVEL GRAPH</h3>
+<canvas id="chart"></canvas>
+</div>
+
+<div class="info">
+<h3>SYSTEM INFORMATION</h3>
+<p>Sensor: MQ-2</p>
+<p>Controller: NodeMCU ESP8266</p>
+<p>Alarm threshold: 240 ADC</p>
+<p>Reset threshold: 220 ADC</p>
+<p>Wi-Fi: <span id="wifi">Checking</span></p>
+<p>Sensor: <span id="sensor">Warming up</span></p>
+</div>
+
+</div>
+
+<script>
+
+const canvas = document.getElementById("chart");
+const ctx = canvas.getContext("2d");
+let history = [];
+
+function drawGraph() {
+
+  let w = canvas.clientWidth;
+  let h = 250;
+  let ratio = window.devicePixelRatio || 1;
+
+  canvas.width = w * ratio;
+  canvas.height = h * ratio;
+
+  ctx.setTransform(ratio,0,0,ratio,0,0);
+  ctx.clearRect(0,0,w,h);
+
+  ctx.strokeStyle = "#52657b";
+  ctx.fillStyle = "white";
+  ctx.font = "11px Arial";
+
+  for(let i=0;i<=5;i++) {
+    let y = 15+i*40;
+
+    ctx.beginPath();
+    ctx.moveTo(35,y);
+    ctx.lineTo(w-10,y);
+    ctx.stroke();
+
+    ctx.fillText(1023-i*204,2,y);
+  }
+
+  if(history.length < 2) return;
+
+  ctx.beginPath();
+
+  history.forEach((v,i)=>{
+    let x = 35+i*(w-50)/(history.length-1);
+    let y = 15+(1023-v)*200/1023;
+
+    if(i===0) ctx.moveTo(x,y);
+    else ctx.lineTo(x,y);
+  });
+
+  ctx.strokeStyle = "#55f0ff";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+async function updateDashboard() {
+
+  try {
+
+    let response = await fetch("/data?t="+Date.now());
+
+    if(!response.ok) throw Error();
+
+    let d = await response.json();
+
+    document.getElementById("gas").textContent = d.gas;
+
+    document.getElementById("wifi").textContent =
+      d.wifi ? "CONNECTED" : "DISCONNECTED";
+
+    document.getElementById("sensor").textContent =
+      d.sensor_ready ? "READY" : "WARMING UP";
+
+    let status = document.getElementById("status");
+    let outputs = document.getElementById("outputs");
+
+    if(!d.sensor_ready) {
+
+      status.textContent = "WARMING UP";
+      status.className = "status warmup";
+      outputs.textContent = "Waiting for sensor warm-up";
+
+    } else if(d.alarm) {
+
+      status.textContent = "SMOKE DETECTED";
+      status.className = "status danger";
+      outputs.textContent =
+        "RED LED ON | YELLOW LED OFF | BUZZER ON";
+
+    } else {
+
+      status.textContent = "NORMAL";
+      status.className = "status normal";
+      outputs.textContent =
+        "YELLOW LED ON | RED LED OFF | BUZZER OFF";
+    }
+
+    history.push(d.gas);
+
+    if(history.length > 30) history.shift();
+
+    drawGraph();
+
+  } catch(e) {
+
+    document.getElementById("status").textContent =
+      "SERVER OFFLINE";
+  }
+}
+
+window.addEventListener("resize",drawGraph);
+
+updateDashboard();
+setInterval(updateDashboard,1000);
+
+</script>
+</body>
+</html>
+)HTML";
+
+// ======================================
+// DASHBOARD ROUTE
+// ======================================
+void handleDashboard() {
+  server.sendHeader("Cache-Control","no-store");
+  server.send_P(200,"text/html",DASHBOARD);
+}
+
+// ======================================
+// SENSOR DATA ROUTE
+// ======================================
+void handleData() {
+
+  String json = "{";
+
+  json += "\"gas\":" + String(gasValue);
+
+  json += ",\"sensor_ready\":";
+  json += sensorReady ? "true" : "false";
+
+  json += ",\"alarm\":";
+  json += smokeDetected ? "true" : "false";
+
+  json += ",\"wifi\":";
+  json += WiFi.status() == WL_CONNECTED ? "true" : "false";
+
+  json += "}";
+
+  server.sendHeader("Cache-Control","no-store");
+  server.send(200,"application/json",json);
+}
+
+// ======================================
+// SETUP
+// ======================================
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(YELLOW_LED,OUTPUT);
+  pinMode(RED_LED,OUTPUT);
+  pinMode(BUZZER,OUTPUT);
+
+  startupTime = millis();
+
+  updateAlarm();
+
+  Serial.println();
+  Serial.println("INNOVEX MQ-2 MONITORING SYSTEM");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+
+  Serial.println("Connecting Wi-Fi...");
+
+  unsigned long start = millis();
+
+  while(WiFi.status() != WL_CONNECTED &&
+        millis()-start < 20000UL) {
+
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if(WiFi.status() == WL_CONNECTED) {
+
+    Serial.println("Wi-Fi Connected!");
+
+    Serial.print("Dashboard IP: http://");
+    Serial.println(WiFi.localIP());
+
+  } else {
+
+    Serial.println("Wi-Fi connection pending");
+
+  }
+
+  server.on("/",HTTP_GET,handleDashboard);
+  server.on("/data",HTTP_GET,handleData);
+
+  server.begin();
+
+  Serial.println("Web server started");
+  Serial.println("60-second sensor warm-up");
+}
+
+// ======================================
+// MAIN LOOP
+// ======================================
+void loop() {
+
+  server.handleClient();
+
+  if(WiFi.status() != WL_CONNECTED &&
+     millis()-lastWiFiCheck >= 10000UL) {
+
+    lastWiFiCheck = millis();
+    WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+  }
+
+  if(millis()-lastRead >= READ_INTERVAL) {
+
+    lastRead = millis();
+    readMQ2();
+  }
+}
